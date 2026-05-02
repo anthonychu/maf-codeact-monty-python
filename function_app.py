@@ -156,3 +156,23 @@ async def run_durable(req: func.HttpRequest, client):
     )
     result = await agent.run(prompt)
     return func.HttpResponse(result.text or "", mimetype="text/plain")
+
+
+@app.route(route="orchestrations/{instanceId}/events/{eventName}", methods=["POST"])
+@app.durable_client_input(client_name="client")
+async def raise_external_event(req: func.HttpRequest, client):
+    instance_id = req.route_params.get("instanceId")
+    event_name = req.route_params.get("eventName")
+    if not instance_id or not event_name:
+        return func.HttpResponse("Instance ID and event name are required.", status_code=400)
+
+    body = req.get_body()
+    payload = None
+    if body:
+        try:
+            payload = req.get_json()
+        except ValueError:
+            return func.HttpResponse("Event payload must be valid JSON.", status_code=400)
+
+    await client.raise_event(instance_id, event_name, payload)
+    return func.HttpResponse(status_code=202)

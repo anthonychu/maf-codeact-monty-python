@@ -28,11 +28,21 @@ def _build_codeact_instructions(tools: Sequence[FunctionTool], *, durable: bool)
 
     durable_note = ""
     if durable:
-        durable_note = (
-            "\n\n`execute_code` runs durably. It returns a JSON object with an `instance_id`.\n"
-            "After calling `execute_code`, call `check_execution(instance_id=...)` to poll for the result.\n"
-            "If the status is `Running`, call `check_execution` again with `wait_seconds` to wait before checking.\n"
-        )
+        durable_note = """
+
+`execute_code` runs durably. It returns a JSON object with an `instance_id`.
+After calling `execute_code`, call `check_execution(instance_id=...)` to poll for the result.
+If the status is `Running`, call `check_execution` again with `wait_seconds` to wait before checking.
+
+IMPORTANT: Code must be deterministic. Do not use `random`, `time.time()`, `uuid4()`, or any other
+non-deterministic operations. The code may be replayed multiple times, and each replay must produce
+the same sequence of tool calls. All non-deterministic work should happen inside tool functions.
+
+Additional durable primitives available inside `execute_code`:
+- `await wait_for_external_event('EventName')` — pauses execution until an external event is raised. Returns the event payload.
+- `await when_any([{"tool": "name", "kwargs": {...}}, ...])` — races multiple tool calls, returns `{"index": <winner_index>, "result": <winner_result>}`.
+- `asyncio.gather(...)` — fan-out: `results = await asyncio.gather(call_tool(...), call_tool(...))` runs tool calls in parallel.
+"""
 
     return f"""You have a primary tool: `execute_code`.
 
@@ -40,6 +50,7 @@ Inside `execute_code`, use `await call_tool(name, **kwargs)` to invoke registere
 Pass the tool name as the first positional argument and all parameters as keyword arguments.
 `call_tool` is async — always use `await` when calling it: `result = await call_tool('tool_name', param=value)`.
 Your code can use standard Python: loops, variables, f-strings, list comprehensions, etc.
+For fan-out, use `asyncio.gather`: `results = await asyncio.gather(call_tool('a'), call_tool('b'))`.
 
 To surface results, end the code with `print(...)`. The sandbox does not return the value of the last expression.
 
@@ -57,6 +68,7 @@ def _build_execute_code_description(tools: Sequence[FunctionTool]) -> str:
 Inside the sandbox, `await call_tool(name, **kwargs)` invokes registered host tools.
 Use the tool name as the first argument and keyword arguments only.
 `call_tool` is async — always use `await`.
+For fan-out, use `asyncio.gather`: `results = await asyncio.gather(call_tool('a'), call_tool('b'))`.
 
 Registered tools:
 {tool_summaries}
@@ -105,6 +117,7 @@ class CodeActProvider(ContextProvider):
         state: dict[str, Any],
     ) -> None:
         normalized_tools = self._normalize_tools()
+        approval_required = {t.name for t in normalized_tools if getattr(t, "approval_mode", None) == "always_require"}
 
         # Build execute_code tool
         if self._durable:
@@ -117,6 +130,10 @@ class CodeActProvider(ContextProvider):
                 tools=normalized_tools,
                 tool_map=self._build_tool_map(),
             )
+
+        # Pre-execution approval: if any tool requires approval, gate execute_code itself
+        if approval_required:
+            execute_code.approval_mode = "always_require"
 
         tools_to_inject: list[FunctionTool] = [execute_code]
 
@@ -202,15 +219,23 @@ def register_durable_codeact(
     app: Any,
     *,
     tools: Sequence[Callable[..., Any]] | None = None,
+    approval_required_tools: set[str] | None = None,
 ) -> None:
     """Register hidden durable infrastructure (orchestrator + activity) on the app.
 
     Call this once at module level. The orchestrator and activity are internal
     and not meant to be called directly by users.
+
+    Args:
+        app: The DFApp instance.
+        tools: List of tool callables to make available as activities.
+        approval_required_tools: Set of tool names that require per-call approval
+            via external events before the activity is scheduled.
     """
     tool_list = list(tools or [])
     tool_map: dict[str, Callable[..., Any]] = {}
     tool_names: set[str] = set()
+    _approval_required = approval_required_tools or set()
     for t in tool_list:
         name = t.__name__ if callable(t) and not isinstance(t, FunctionTool) else getattr(t, "name", str(t))
         tool_map[name] = t
@@ -220,7 +245,7 @@ def register_durable_codeact(
     @app.orchestration_trigger(context_name="context")
     def codeact_orchestrator(context):
         code = context.get_input()
-        bridge = DurableCodeBridge(context, tool_names=tool_names)
+        bridge = DurableCodeBridge(context, tool_names=tool_names, approval_required_tools=_approval_required)
         return (yield from bridge.run(code))
 
     # Register activity
