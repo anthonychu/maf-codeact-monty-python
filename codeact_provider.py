@@ -7,7 +7,7 @@ from typing import Any
 
 from agent_framework import AgentSession, ContextProvider, FunctionTool, SessionContext
 
-from monty_bridge import DurableCodeBridge, InlineCodeBridge
+from monty_bridge import DurableCodeBridge, InlineCodeBridge, generate_type_stubs
 
 
 def _build_tool_summaries(tools: Sequence[FunctionTool]) -> str:
@@ -41,23 +41,22 @@ the same sequence of tool calls. All non-deterministic work should happen inside
 Additional durable primitives available inside `execute_code`:
 - `await wait_for_external_event('EventName')` — pauses execution until an external event is raised. Returns the event payload.
 - `await when_any([{"tool": "name", "kwargs": {...}}, ...])` — races multiple tool calls, returns `{"index": <winner_index>, "result": <winner_result>}`.
-- `asyncio.gather(...)` — fan-out: `results = await asyncio.gather(call_tool(...), call_tool(...))` runs tool calls in parallel.
+- `asyncio.gather(...)` — fan-out: `results = await asyncio.gather(tool_a(...), tool_b(...))` runs tool calls in parallel.
 """
 
     return f"""You have a primary tool: `execute_code`.
 
-Inside `execute_code`, use `await call_tool(name, **kwargs)` to invoke registered tools.
-Pass the tool name as the first positional argument and all parameters as keyword arguments.
-`call_tool` is async — always use `await` when calling it: `result = await call_tool('tool_name', param=value)`.
-Your code can use standard Python: loops, variables, f-strings, list comprehensions, etc.
-For fan-out, use `asyncio.gather`: `results = await asyncio.gather(call_tool('a'), call_tool('b'))`.
+Inside `execute_code`, call registered tools directly as async functions:
+`result = await tool_name(param=value)`. Always use `await` and keyword arguments.
+Your code is type-checked — argument types must match the tool signatures below.
+For fan-out, use `asyncio.gather`: `results = await asyncio.gather(tool_a(...), tool_b(...))`.
 
 To surface results, end the code with `print(...)`. The sandbox does not return the value of the last expression.
 
 Registered tools:
 {tool_summaries}
 
-Prefer a single `execute_code` call when possible, combining multiple `await call_tool(...)` calls with Python control flow.{durable_note}
+Prefer a single `execute_code` call when possible, combining multiple tool calls with Python control flow.{durable_note}
 """
 
 
@@ -65,10 +64,10 @@ def _build_execute_code_description(tools: Sequence[FunctionTool]) -> str:
     tool_summaries = _build_tool_summaries(tools)
     return f"""Execute Python code in a sandboxed environment.
 
-Inside the sandbox, `await call_tool(name, **kwargs)` invokes registered host tools.
-Use the tool name as the first argument and keyword arguments only.
-`call_tool` is async — always use `await`.
-For fan-out, use `asyncio.gather`: `results = await asyncio.gather(call_tool('a'), call_tool('b'))`.
+Inside the sandbox, call registered tools directly as async functions:
+`result = await tool_name(param=value)`. Always use `await` and keyword arguments.
+Code is type-checked against tool signatures before execution.
+For fan-out, use `asyncio.gather`: `results = await asyncio.gather(tool_a(...), tool_b(...))`.
 
 Registered tools:
 {tool_summaries}
@@ -108,6 +107,14 @@ class CodeActProvider(ContextProvider):
                 tool_map[raw_tool.name] = raw_tool.invoke
         return tool_map
 
+    def _build_raw_tool_map(self) -> dict[str, Callable[..., Any]]:
+        """Build name -> original callable map (for type stub generation)."""
+        tool_map: dict[str, Callable[..., Any]] = {}
+        for raw_tool in self._raw_tools:
+            if callable(raw_tool) and not isinstance(raw_tool, FunctionTool):
+                tool_map[raw_tool.__name__] = raw_tool
+        return tool_map
+
     async def before_run(
         self,
         *,
@@ -119,6 +126,10 @@ class CodeActProvider(ContextProvider):
         normalized_tools = self._normalize_tools()
         approval_required = {t.name for t in normalized_tools if getattr(t, "approval_mode", None) == "always_require"}
 
+        # Generate type stubs from tool signatures
+        raw_tool_map = self._build_raw_tool_map()
+        type_stubs = generate_type_stubs(raw_tool_map) if raw_tool_map else None
+
         # Build execute_code tool
         if self._durable:
             execute_code = _make_durable_execute_code_tool(
@@ -129,6 +140,7 @@ class CodeActProvider(ContextProvider):
             execute_code = _make_inline_execute_code_tool(
                 tools=normalized_tools,
                 tool_map=self._build_tool_map(),
+                type_stubs=type_stubs,
             )
 
         # Pre-execution approval: if any tool requires approval, gate execute_code itself
@@ -150,12 +162,13 @@ def _make_inline_execute_code_tool(
     *,
     tools: Sequence[FunctionTool],
     tool_map: dict[str, Callable[..., Any]],
+    type_stubs: str | None = None,
 ) -> FunctionTool:
     description = _build_execute_code_description(tools)
 
     async def execute_code(*, code: str) -> str:
         """Execute Python code in a sandboxed environment."""
-        bridge = InlineCodeBridge(tool_map)
+        bridge = InlineCodeBridge(tool_map, type_stubs=type_stubs)
         result = await bridge.run(code)
         return json.dumps(result)
 
@@ -241,11 +254,18 @@ def register_durable_codeact(
         tool_map[name] = t
         tool_names.add(name)
 
+    # Generate type stubs from tool signatures
+    _type_stubs = generate_type_stubs(tool_map) if tool_map else None
+
     # Register orchestrator
     @app.orchestration_trigger(context_name="context")
     def codeact_orchestrator(context):
         code = context.get_input()
-        bridge = DurableCodeBridge(context, tool_names=tool_names, approval_required_tools=_approval_required)
+        bridge = DurableCodeBridge(
+            context, tool_names=tool_names,
+            approval_required_tools=_approval_required,
+            type_stubs=_type_stubs,
+        )
         return (yield from bridge.run(code))
 
     # Register activity

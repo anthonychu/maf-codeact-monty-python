@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import typing
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any, get_type_hints
 
 from pydantic_monty import FunctionSnapshot, FutureSnapshot, Monty, MontyComplete, NameLookupSnapshot
 
@@ -125,6 +126,85 @@ def _build_code(code: str) -> str:
     return f"{CODEACT_PRELUDE}\n{code}"
 
 
+def _python_type_repr(annotation: Any) -> str:
+    """Convert a Python type annotation to its string representation for stubs."""
+    if annotation is inspect.Parameter.empty or annotation is type(None):
+        return "Any"
+    origin = typing.get_origin(annotation)
+    # Handle Annotated[X, ...] — unwrap to just X
+    if origin is Annotated:
+        args = typing.get_args(annotation)
+        return _python_type_repr(args[0]) if args else "Any"
+    if origin is not None:
+        args = typing.get_args(annotation)
+        # Map generic aliases to their readable names
+        origin_name = getattr(origin, "__name__", None)
+        if origin_name is None:
+            # Handle things like list, dict which show as typing.List etc.
+            origin_name = str(origin)
+            # Clean up "<class 'list'>" -> "list"
+            if origin_name.startswith("<class '"):
+                origin_name = origin_name[8:-2]
+        if args:
+            arg_strs = ", ".join(_python_type_repr(a) for a in args)
+            return f"{origin_name}[{arg_strs}]"
+        return origin_name
+    if hasattr(annotation, "__name__"):
+        return annotation.__name__
+    return str(annotation)
+
+
+def generate_type_stubs(tool_callables: dict[str, Callable[..., Any]]) -> str:
+    """Generate Python type stub declarations for tools + DSL functions.
+
+    These stubs are passed to Monty's type_check_stubs so ty can validate
+    the LLM-generated code against actual tool signatures.
+    """
+    lines = [
+        "from typing import Any",
+        "",
+        "# DSL primitives",
+        "async def call_tool(name: str, **kwargs: Any) -> Any:",
+        "    raise NotImplementedError()",
+        "",
+        "async def wait_for_external_event(name: str) -> Any:",
+        "    raise NotImplementedError()",
+        "",
+        "async def when_any(specs: list[dict[str, Any]]) -> dict[str, Any]:",
+        "    raise NotImplementedError()",
+        "",
+        "# Registered tools — call directly with typed arguments",
+    ]
+
+    for name, func in sorted(tool_callables.items()):
+        try:
+            sig = inspect.signature(func)
+            hints = get_type_hints(func, include_extras=True)
+        except (ValueError, TypeError):
+            lines.append(f"async def {name}(**kwargs: Any) -> Any:")
+            lines.append("    raise NotImplementedError()")
+            lines.append("")
+            continue
+
+        params: list[str] = []
+        for param_name, param in sig.parameters.items():
+            ann = hints.get(param_name, inspect.Parameter.empty)
+            type_str = _python_type_repr(ann)
+            if param.default is not inspect.Parameter.empty:
+                params.append(f"{param_name}: {type_str} = ...")
+            else:
+                params.append(f"{param_name}: {type_str}")
+
+        return_ann = hints.get("return", inspect.Parameter.empty)
+        return_str = _python_type_repr(return_ann)
+        param_str = ", ".join(params)
+        lines.append(f"async def {name}({param_str}) -> {return_str}:")
+        lines.append("    raise NotImplementedError()")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 class _PrintCollector:
     def __init__(self) -> None:
         self.chunks: list[str] = []
@@ -153,20 +233,26 @@ class _PrintCollector:
 class InlineCodeBridge:
     """Execute Monty code inline (non-durable). Tool calls invoke functions directly.
 
-    call_tool returns a future so the LLM code uses `await call_tool(...)`.
+    Supports both `await call_tool('name', ...)` and direct `await name(...)` calls.
     When Monty yields a FutureSnapshot, the bridge invokes the tool and resumes.
     """
 
-    def __init__(self, tool_map: dict[str, Callable[..., Any]]) -> None:
+    def __init__(self, tool_map: dict[str, Callable[..., Any]], *, type_stubs: str | None = None) -> None:
         self.tool_map = tool_map
-        self.pending_calls: dict[int, tuple[str, dict[str, Any]]] = {}
+        self.type_stubs = type_stubs
+        self.pending_calls: dict[int, tuple[str, str, dict[str, Any]]] = {}
 
     async def run(self, code: str) -> dict[str, Any]:
         if not isinstance(code, str) or not code.strip():
             raise ValueError("Code must be a non-empty string.")
 
         printer = _PrintCollector()
-        monty = Monty(_build_code(code), script_name="codeact.py")
+        monty = Monty(
+            _build_code(code),
+            script_name="codeact.py",
+            type_check=self.type_stubs is not None,
+            type_check_stubs=self.type_stubs,
+        )
         progress = monty.start(print_callback=printer)
 
         while True:
@@ -193,6 +279,11 @@ class InlineCodeBridge:
             })
 
         function_name = str(snapshot.function_name)
+
+        # Direct tool call: await list_users(...)
+        if function_name in self.tool_map:
+            return self._schedule_direct_tool(snapshot, function_name)
+        # Generic: await call_tool('name', ...)
         if function_name == "call_tool":
             return self._schedule_call_tool(snapshot)
         if function_name == "wait_for_external_event":
@@ -205,8 +296,24 @@ class InlineCodeBridge:
 
         return snapshot.resume({
             "exc_type": "NameError",
-            "message": f"Function {function_name!r} is not available. Use call_tool(name, **kwargs) to call tools.",
+            "message": f"Function {function_name!r} is not available.",
         })
+
+    def _schedule_direct_tool(self, snapshot: FunctionSnapshot, name: str) -> Any:
+        try:
+            kwargs = dict(snapshot.kwargs)
+            # Also support positional args mapped to parameter names
+            if snapshot.args:
+                func = self.tool_map[name]
+                sig = inspect.signature(func)
+                param_names = [p for p in sig.parameters]
+                for i, arg in enumerate(snapshot.args):
+                    if i < len(param_names):
+                        kwargs[param_names[i]] = arg
+            self.pending_calls[int(snapshot.call_id)] = ("call_tool", name, kwargs)
+        except Exception as exc:
+            return snapshot.resume(_external_error(exc))
+        return snapshot.resume({"future": ...})
 
     def _schedule_call_tool(self, snapshot: FunctionSnapshot) -> Any:
         try:
@@ -285,10 +392,11 @@ class DurableCodeBridge:
 
     ACTIVITY_NAME = "codeact_call_tool"
 
-    def __init__(self, context: Any, tool_names: set[str], approval_required_tools: set[str] | None = None) -> None:
+    def __init__(self, context: Any, tool_names: set[str], approval_required_tools: set[str] | None = None, type_stubs: str | None = None) -> None:
         self.context = context
         self.tool_names = tool_names
         self.approval_required_tools = approval_required_tools or set()
+        self.type_stubs = type_stubs
         self.pending_work: dict[int, _ToolCallWork | _ExternalEventWork | _WhenAnyWork | _ApprovalThenToolWork] = {}
         self.printer = _PrintCollector()
 
@@ -296,7 +404,12 @@ class DurableCodeBridge:
         if not isinstance(code, str) or not code.strip():
             raise ValueError("The orchestrator input must be a non-empty Python code string.")
 
-        monty = Monty(_build_code(code), script_name="codeact.py")
+        monty = Monty(
+            _build_code(code),
+            script_name="codeact.py",
+            type_check=self.type_stubs is not None,
+            type_check_stubs=self.type_stubs,
+        )
         progress = monty.start(print_callback=self.printer)
 
         while True:
@@ -323,6 +436,11 @@ class DurableCodeBridge:
             })
 
         function_name = str(snapshot.function_name)
+
+        # Direct tool call: await list_users(...)
+        if function_name in self.tool_names:
+            return self._schedule_direct_tool(snapshot, function_name)
+        # Generic: await call_tool('name', ...)
         if function_name == "call_tool":
             return self._schedule_call_tool(snapshot)
         if function_name == "wait_for_external_event":
@@ -332,8 +450,31 @@ class DurableCodeBridge:
 
         return snapshot.resume({
             "exc_type": "NameError",
-            "message": f"Function {function_name!r} is not available. Use call_tool(name, **kwargs) to call tools.",
+            "message": f"Function {function_name!r} is not available.",
         })
+
+    def _schedule_direct_tool(self, snapshot: FunctionSnapshot, name: str) -> Any:
+        """Handle a direct tool call like `await list_users(...)` — same as call_tool but name comes from the function."""
+        try:
+            kwargs = dict(snapshot.kwargs)
+            if snapshot.args:
+                # Map positional args — we don't have the function sig in durable mode,
+                # so just reject positional args to keep it clean
+                raise ValueError(f"Direct tool calls must use keyword arguments. Use: await {name}(key=value, ...)")
+
+            if name in self.approval_required_tools:
+                event_name = f"approve:{name}:{snapshot.call_id}"
+                approval_task = self.context.wait_for_external_event(event_name)
+                self.pending_work[int(snapshot.call_id)] = _ApprovalThenToolWork(
+                    name=name, kwargs=kwargs, approval_task=approval_task,
+                )
+            else:
+                payload = {"name": name, "kwargs": _ensure_json_value(kwargs)}
+                task = self.context.call_activity(self.ACTIVITY_NAME, payload)
+                self.pending_work[int(snapshot.call_id)] = _ToolCallWork(name=name, kwargs=kwargs, task=task)
+        except Exception as exc:
+            return snapshot.resume(_external_error(exc))
+        return snapshot.resume({"future": ...})
 
     def _schedule_call_tool(self, snapshot: FunctionSnapshot) -> Any:
         try:

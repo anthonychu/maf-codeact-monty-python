@@ -89,14 +89,15 @@ The DTS dashboard is at `http://localhost:8082`.
 │                 │                                        │
 │    ┌────────────┴────────────┐                           │
 │    ▼                         ▼                           │
-│  InlineCodeBridge      DurableCodeBridge                 │
-│  (monty_bridge.py)     (monty_bridge.py)                 │
-│  - Monty runs code     - Monty runs code                 │
-│  - call_tool → direct  - call_tool → Durable activity    │
-│    function call        - wait_for_external_event        │
+│  InlineCodeBridge       DurableCodeBridge                │
+│  (monty_bridge.py)      (monty_bridge.py)                │
+│  - Monty runs code      - Monty runs code                │
+│  - Type-checked via ty  - Type-checked via ty            │
+│  - Direct tool calls    - Direct tool calls → activities │
 │  - asyncio.gather       - asyncio.gather → task_all      │
 │    (sequential)         - when_any → task_any            │
 │  - Ephemeral            - Durable replay                 │
+│                         - Per-tool approval via events   │
 │                                                          │
 │  register_durable_codeact(app, tools)                    │
 │  - codeact_orchestrator (hidden)                         │
@@ -106,15 +107,18 @@ The DTS dashboard is at `http://localhost:8082`.
 
 ## DSL Available Inside `execute_code`
 
-The LLM generates Python code using these primitives:
+The LLM generates Python code that calls tools directly as typed async functions. Code is type-checked against tool signatures before execution using [ty](https://docs.astral.sh/ty/) (included in Monty).
 
 | Primitive | Non-durable | Durable |
 |---|---|---|
-| `await call_tool('name', key=val)` | Direct function call | Durable activity invocation |
-| `asyncio.gather(call_tool(...), ...)` | Sequential execution | Parallel via `task_all` |
+| `await list_users()` | Direct function call | Durable activity invocation |
+| `await get_orders_for_user(user_id=1)` | Direct function call (type-checked) | Durable activity (type-checked) |
+| `asyncio.gather(tool_a(...), tool_b(...))` | Sequential execution | Parallel via `task_all` |
 | `await when_any([{"tool": "n", "kwargs": {...}}, ...])` | Runs all, returns first | True race via `task_any` |
 | `await wait_for_external_event('EventName')` | Rejected (not available) | Waits for external event |
 | `print(...)` | Captured in stdout | Captured in stdout |
+
+`await call_tool('name', key=val)` is also supported as a fallback but is not type-checked.
 
 ## Feature Comparison: Hyperlight CodeAct vs. Monty CodeAct
 
@@ -133,9 +137,10 @@ The LLM generates Python code using these primitives:
 
 | | Hyperlight | Monty (non-durable) | Monty (durable) |
 |---|---|---|---|
-| **DSL** | `call_tool(name, **kwargs)` — synchronous, via FFI host callback | `await call_tool(name, **kwargs)` — async, future-based | `await call_tool(name, **kwargs)` — async, future → Durable activity |
+| **DSL** | `call_tool(name, **kwargs)` — synchronous, stringly-typed, via FFI host callback | `await tool_name(**kwargs)` — async, directly typed. `call_tool` also supported as fallback. | Same — `await tool_name(**kwargs)`, dispatched as Durable activity |
+| **Type safety** | None. `call_tool` is stringly-typed; argument errors discovered at runtime. | **Type-checked before execution.** Type stubs auto-generated from tool signatures; [ty](https://docs.astral.sh/ty/) validates argument types, counts, and return types at parse time. Wrong types → `MontyTypingError` before any tool runs. | Same type checking. Errors caught before any activities fire. |
 | **How host tools are invoked** | FFI bridge: WASM guest calls out to host Python. The callback runs `asyncio.run()` on a new `threading.Thread` to handle async `FunctionTool.invoke()`. | Direct Python call. Supports sync and async tools via `inspect.iscoroutinefunction()`. | `context.call_activity("codeact_call_tool", {name, kwargs})` — tool runs in a separate activity function invocation. |
-| **Approval mode** | Supported. `always_require` / `never_require` per tool or per `execute_code` call. If any tool requires approval, the entire code block is gated. | Not implemented. | Not implemented. |
+| **Approval mode** | Pre-execution only. `always_require` / `never_require` per tool or per `execute_code` call. If any tool requires approval, the entire code block is gated before execution. No per-tool mid-execution approval. | Pre-execution gating: if any tool has `approval_mode="always_require"`, the entire `execute_code` call is gated. | **Both.** Pre-execution gating (same as non-durable) + **per-tool mid-execution approval**: individual tool calls pause the orchestration for an external event (`approve:{tool}:{id}`) before the activity runs. Approve or deny each call granularly. |
 
 ### Fan-out / Concurrency
 
@@ -161,7 +166,8 @@ The LLM generates Python code using these primitives:
 |---|---|---|---|
 | **Filesystem** | Opt-in: `/input` (read), `/output` (write). Host paths copied to temp dirs. Files written to `/output` are attached to tool result as `Content`. | Blocked in generated code (`PermissionError`). Host-side tool functions have full access. | Blocked in generated code (`PermissionError`). Host-side tool functions have full access. |
 | **Network** | Opt-in: per-domain allow-list with HTTP method filtering. Enforced at sandbox boundary. Tools always run on host with full network access. | Blocked in generated code. Tool functions run on the host and can make any network calls. | Blocked in generated code. Tool functions run on the host (as activities) and can make any network calls. |
-| **Python compatibility** | WASM Python guest (`python_guest.path`). Likely compiled CPython with most stdlib, but exact coverage undocumented. | Monty: Rust-based Python interpreter. Subset of Python — not all features/stdlib supported. | Same as non-durable. |
+| **Python compatibility** | WASM Python guest (`python_guest.path`). Likely compiled CPython with most stdlib, but exact coverage undocumented. | Monty: Rust-based Python interpreter. Subset of Python — not all features/stdlib supported. Supported: `sys`, `os`, `typing`, `asyncio`, `re`, `datetime`, `json`. | Same as non-durable. |
+| **Type checking** | None. | **Yes.** Type stubs auto-generated from tool `Annotated` signatures. Monty runs [ty](https://docs.astral.sh/ty/) before execution — catches wrong argument types, missing parameters, return type mismatches. | Same. Errors caught before any Durable activities fire. |
 | **OS calls** | Blocked by default (no host access except registered tools, mounts, and allowed domains). | Blocked (`PermissionError` via `is_os_function`). | Blocked. |
 | **Stdout capture** | `result.stdout` captured, returned as `Content.from_text()`. | Captured via `print_callback`, returned in result JSON. | Same. |
 | **State management** | Snapshot/restore between calls (`sandbox.snapshot()` + `sandbox.restore()`). Each `execute_code` gets a clean sandbox. Sandboxes cached by config key. | Fresh `Monty()` instance per call. | Fresh Monty instance per **replay** (not just per orchestration). Each Durable replay re-creates `DurableCodeBridge` and `Monty(code)` from scratch; Durable history makes already-completed tasks resolve immediately so the code reaches the next pending point quickly. |
@@ -187,10 +193,9 @@ The LLM generates Python code using these primitives:
 
 **Monty CodeAct (non-durable):**
 - Monty interprets a Python **subset** — not all Python features or stdlib modules are available.
-- No filesystem or network access (no opt-in mechanism like Hyperlight's mounts/domains).
-- No approval mode for tools.
 - Fan-out (`asyncio.gather`) and `when_any` execute tools sequentially, not in parallel.
 - Ephemeral — no durability, no external events.
+- Per-tool mid-execution approval not available (only pre-execution gating).
 
 **Monty CodeAct (durable):**
 - Same Monty Python subset limitation.
@@ -205,9 +210,11 @@ The LLM generates Python code using these primitives:
 | **Ease of setup** | Monty non-durable (zero infra, any platform) |
 | **Cross-platform** | Monty (both modes) |
 | **Sandbox security** | Hyperlight (WASM-level isolation with snapshot/restore) |
+| **Type safety** | Monty (both modes — ty validates tool call types before execution) |
 | **True parallel tool execution** | Monty durable (`task_all` for activities) |
 | **Durability / reliability** | Monty durable (Durable Functions replay) |
 | **Human-in-the-loop** | Monty durable (external events) |
+| **Per-tool approval** | Monty durable (mid-execution approval via external events) |
 | **Python compatibility** | Hyperlight (WASM Python guest, likely fuller stdlib) |
 | **Code portability (durable ↔ non-durable)** | Monty (same code both modes, flip a flag) |
 
@@ -217,7 +224,7 @@ The LLM generates Python code using these primitives:
 |---|---|
 | `function_app.py` | HTTP triggers (`/api/run`, `/api/run-durable`, `/api/orchestrations/.../events/...`), sample tools, LLM client |
 | `codeact_provider.py` | `CodeActProvider`, `execute_code`/`check_execution` tools, instructions builder, `register_durable_codeact()` |
-| `monty_bridge.py` | `InlineCodeBridge` (non-durable) and `DurableCodeBridge` (durable) — Monty execution engines |
+| `monty_bridge.py` | `InlineCodeBridge` (non-durable) and `DurableCodeBridge` (durable) — Monty execution engines, type stub generator |
 | `requirements.txt` | Python dependencies |
 | `host.json` | Functions host config + DTS durableTask extension |
 | `local.settings.json` | Foundry, DTS, and storage config |
