@@ -7,7 +7,7 @@ from typing import Any
 
 from agent_framework import AgentSession, ContextProvider, FunctionTool, SessionContext
 
-from monty_bridge import DurableCodeBridge, InlineCodeBridge, generate_type_stubs
+from codeact.monty_bridge import DurableCodeBridge, InlineCodeBridge, generate_type_stubs
 
 
 def _build_tool_summaries(tools: Sequence[FunctionTool]) -> str:

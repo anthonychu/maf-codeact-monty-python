@@ -9,7 +9,7 @@ from agent_framework import Agent
 from agent_framework.foundry import FoundryChatClient
 from azure.identity import AzureCliCredential
 
-from codeact_provider import CodeActProvider, register_durable_codeact
+from codeact.codeact_provider import CodeActProvider, register_durable_codeact
 
 
 # ---------------------------------------------------------------------------
