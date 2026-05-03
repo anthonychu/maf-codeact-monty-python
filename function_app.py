@@ -146,6 +146,10 @@ async def run(req: func.HttpRequest):
 @app.route(route="run-durable", methods=["POST"])
 @app.durable_client_input(client_name="client")
 async def run_durable(req: func.HttpRequest, client):
+    import logging
+    logger = logging.getLogger("codeact.durable")
+    logger.setLevel(logging.DEBUG)
+
     prompt = req.get_body().decode().strip() or BENCHMARK_PROMPT
     codeact = CodeActProvider(tools=TOOLS, durable=True, durable_client=client)
     agent = Agent(
@@ -155,6 +159,20 @@ async def run_durable(req: func.HttpRequest, client):
         context_providers=[codeact],
     )
     result = await agent.run(prompt)
+
+    # Log conversation details
+    if result.messages:
+        for i, msg in enumerate(result.messages):
+            role = getattr(msg, 'role', '?')
+            content = getattr(msg, 'content', '')
+            tool_calls = getattr(msg, 'tool_calls', None)
+            name = getattr(msg, 'name', None)
+            text = str(content)[:200] if content else ''
+            print(f"MSG[{i}] role={role} name={name} text={text[:100]}")
+            if tool_calls:
+                for tc in tool_calls:
+                    print(f"  TOOL_CALL: {getattr(tc, 'function', tc)}")
+
     return func.HttpResponse(result.text or "", mimetype="text/plain")
 
 

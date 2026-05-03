@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import typing
@@ -154,7 +155,7 @@ def _python_type_repr(annotation: Any) -> str:
     return str(annotation)
 
 
-def generate_type_stubs(tool_callables: dict[str, Callable[..., Any]]) -> str:
+def generate_type_stubs(tool_callables: dict[str, Callable[..., Any]], *, durable: bool = False) -> str:
     """Generate Python type stub declarations for tools + DSL functions.
 
     These stubs are passed to Monty's type_check_stubs so ty can validate
@@ -167,14 +168,21 @@ def generate_type_stubs(tool_callables: dict[str, Callable[..., Any]]) -> str:
         "async def call_tool(name: str, **kwargs: Any) -> Any:",
         "    raise NotImplementedError()",
         "",
-        "async def wait_for_external_event(name: str) -> Any:",
-        "    raise NotImplementedError()",
-        "",
+    ]
+
+    if durable:
+        lines.extend([
+            "async def wait_for_external_event(name: str) -> Any:",
+            "    raise NotImplementedError()",
+            "",
+        ])
+
+    lines.extend([
         "async def when_any(specs: list[dict[str, Any]]) -> dict[str, Any]:",
         "    raise NotImplementedError()",
         "",
         "# Registered tools — call directly with typed arguments",
-    ]
+    ])
 
     for name, func in sorted(tool_callables.items()):
         try:
@@ -286,11 +294,6 @@ class InlineCodeBridge:
         # Generic: await call_tool('name', ...)
         if function_name == "call_tool":
             return self._schedule_call_tool(snapshot)
-        if function_name == "wait_for_external_event":
-            return snapshot.resume({
-                "exc_type": "RuntimeError",
-                "message": "wait_for_external_event is only available in durable mode.",
-            })
         if function_name == "when_any":
             return self._schedule_when_any(snapshot)
 
@@ -339,46 +342,66 @@ class InlineCodeBridge:
         if not pending_call_ids:
             return snapshot.resume({})
 
-        resume_results: dict[int, Any] = {}
+        # Collect all pending entries
+        entries = []
         for cid in pending_call_ids:
             if cid not in self.pending_calls:
                 raise RuntimeError(f"Unknown future call ID: {cid}")
-            entry = self.pending_calls.pop(cid)
-            kind = entry[0]
+            entries.append((cid, self.pending_calls.pop(cid)))
 
-            if kind == "call_tool":
-                _, name, kwargs = entry
+        # Separate call_tool entries (can run concurrently) from when_any
+        call_tool_entries = [(cid, e) for cid, e in entries if e[0] == "call_tool"]
+        when_any_entries = [(cid, e) for cid, e in entries if e[0] == "when_any"]
+
+        resume_results: dict[int, Any] = {}
+
+        # Run all call_tool invocations concurrently
+        if call_tool_entries:
+            async def _invoke_tool(cid: int, name: str, kwargs: dict[str, Any]) -> tuple[int, Any]:
                 try:
                     tool_func = self.tool_map[name]
                     if inspect.iscoroutinefunction(tool_func):
                         result = await tool_func(**kwargs)
                     else:
-                        result = tool_func(**kwargs)
-                    resume_results[cid] = {"return_value": _ensure_json_value(result)}
+                        result = await asyncio.to_thread(tool_func, **kwargs)
+                    return cid, {"return_value": _ensure_json_value(result)}
                 except Exception as exc:
-                    resume_results[cid] = _external_error(exc)
+                    return cid, _external_error(exc)
 
-            elif kind == "when_any":
-                _, specs, _ = entry
-                try:
-                    # In inline mode, run all tools and return the first result
-                    first_result = None
-                    first_index = 0
-                    for i, (name, kwargs) in enumerate(specs):
-                        tool_func = self.tool_map[name]
-                        if inspect.iscoroutinefunction(tool_func):
-                            r = await tool_func(**kwargs)
-                        else:
-                            r = tool_func(**kwargs)
-                        if first_result is None:
-                            first_result = r
-                            first_index = i
-                    resume_results[cid] = {"return_value": _ensure_json_value({
-                        "index": first_index,
-                        "result": _ensure_json_value(first_result),
-                    })}
-                except Exception as exc:
-                    resume_results[cid] = _external_error(exc)
+            tasks = [_invoke_tool(cid, e[1], e[2]) for cid, e in call_tool_entries]
+            results = await asyncio.gather(*tasks)
+            for cid, result in results:
+                resume_results[cid] = result
+
+        # Run when_any concurrently — race all tools, return the first to complete
+        for cid, entry in when_any_entries:
+            _, specs, _ = entry
+            try:
+                async def _run_when_any_tool(index: int, name: str, kwargs: dict[str, Any]) -> tuple[int, Any]:
+                    tool_func = self.tool_map[name]
+                    if inspect.iscoroutinefunction(tool_func):
+                        return index, await tool_func(**kwargs)
+                    else:
+                        return index, await asyncio.to_thread(tool_func, **kwargs)
+
+                tasks = [_run_when_any_tool(i, name, kw) for i, (name, kw) in enumerate(specs)]
+                # Use asyncio.wait with FIRST_COMPLETED for a true race
+                done, pending = await asyncio.wait(
+                    [asyncio.ensure_future(t) for t in tasks],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Cancel remaining tasks
+                for task in pending:
+                    task.cancel()
+                # Get the winner
+                winner = next(iter(done))
+                winner_index, winner_result = winner.result()
+                resume_results[cid] = {"return_value": _ensure_json_value({
+                    "index": winner_index,
+                    "result": _ensure_json_value(winner_result),
+                })}
+            except Exception as exc:
+                resume_results[cid] = _external_error(exc)
 
         return snapshot.resume(resume_results)
 

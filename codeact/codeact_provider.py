@@ -30,23 +30,27 @@ def _build_codeact_instructions(tools: Sequence[FunctionTool], *, durable: bool)
     if durable:
         durable_note = """
 
-`execute_code` runs durably. It returns a JSON object with an `instance_id`.
-After calling `execute_code`, call `check_execution(instance_id=...)` to poll for the result.
-If the status is `Running`, call `check_execution` again with `wait_seconds` to wait before checking.
+Use `start_execute_code` to run code durably. It returns an instance_id but NOT the result.
+After calling `start_execute_code`, you MUST call `get_execution_result(instance_id=..., wait_seconds=3)` to get the result.
+- If status is `Running`, call `get_execution_result` again with `wait_seconds=3`.
+- If status is `Completed`, the `result` field contains the output — use it as your answer.
+- If status is `Failed`, the `error` field explains what went wrong.
+- Keep calling `get_execution_result` until you get `Completed` or `Failed`.
 
 IMPORTANT: Code must be deterministic. Do not use `random`, `time.time()`, `uuid4()`, or any other
-non-deterministic operations. The code may be replayed multiple times, and each replay must produce
-the same sequence of tool calls. All non-deterministic work should happen inside tool functions.
+non-deterministic operations. The code may be replayed multiple times.
 
-Additional durable primitives available inside `execute_code`:
+Additional durable primitives available inside `start_execute_code`:
 - `await wait_for_external_event('EventName')` — pauses execution until an external event is raised. Returns the event payload.
 - `await when_any([{"tool": "name", "kwargs": {...}}, ...])` — races multiple tool calls, returns `{"index": <winner_index>, "result": <winner_result>}`.
 - `asyncio.gather(...)` — fan-out: `results = await asyncio.gather(tool_a(...), tool_b(...))` runs tool calls in parallel.
 """
 
-    return f"""You have a primary tool: `execute_code`.
+    primary_tool = "start_execute_code" if durable else "execute_code"
 
-Inside `execute_code`, call registered tools directly as async functions:
+    return f"""You have a primary tool: `{primary_tool}`.
+
+Inside `{primary_tool}`, call registered tools directly as async functions:
 `result = await tool_name(param=value)`. Always use `await` and keyword arguments.
 Your code is type-checked — argument types must match the tool signatures below.
 For fan-out, use `asyncio.gather`: `results = await asyncio.gather(tool_a(...), tool_b(...))`.
@@ -56,7 +60,7 @@ To surface results, end the code with `print(...)`. The sandbox does not return 
 Registered tools:
 {tool_summaries}
 
-Prefer a single `execute_code` call when possible, combining multiple tool calls with Python control flow.{durable_note}
+Prefer a single `{primary_tool}` call when possible, combining multiple tool calls with Python control flow.{durable_note}
 """
 
 
@@ -128,7 +132,7 @@ class CodeActProvider(ContextProvider):
 
         # Generate type stubs from tool signatures
         raw_tool_map = self._build_raw_tool_map()
-        type_stubs = generate_type_stubs(raw_tool_map) if raw_tool_map else None
+        type_stubs = generate_type_stubs(raw_tool_map, durable=self._durable) if raw_tool_map else None
 
         # Build execute_code tool
         if self._durable:
@@ -150,7 +154,7 @@ class CodeActProvider(ContextProvider):
         tools_to_inject: list[FunctionTool] = [execute_code]
 
         if self._durable:
-            check_exec = _make_check_execution_tool(self._durable_client)
+            check_exec = _make_get_execution_result_tool(self._durable_client)
             tools_to_inject.append(check_exec)
 
         instructions = _build_codeact_instructions(normalized_tools, durable=self._durable)
@@ -185,46 +189,99 @@ def _make_durable_execute_code_tool(
     durable_client: Any,
 ) -> FunctionTool:
     description = _build_execute_code_description(tools) + (
-        "\n\nThis tool runs code durably. It returns a JSON object with an `instance_id` "
-        "that you can use with `check_execution` to poll for the result."
+        "\n\nThis tool starts a durable code execution. It returns an instance_id but NOT the result. "
+        "After calling this, you MUST call `get_execution_result(instance_id=..., wait_seconds=3)` "
+        "to retrieve the actual output."
     )
 
-    async def execute_code(*, code: str) -> str:
-        """Execute Python code durably via an orchestration."""
+    async def start_execute_code(*, code: str) -> str:
+        """Start a durable Python code execution. Returns an instance_id — call get_execution_result next."""
         instance_id = await durable_client.start_new("codeact_orchestrator", None, code)
-        return json.dumps({"instance_id": instance_id})
+        return (
+            f"Execution started (instance_id: {instance_id}). "
+            f"Call get_execution_result(instance_id=\"{instance_id}\", wait_seconds=3) to get the output."
+        )
 
     return FunctionTool(
-        name="execute_code",
+        name="start_execute_code",
         description=description,
-        func=execute_code,
+        func=start_execute_code,
     )
 
 
-def _make_check_execution_tool(durable_client: Any) -> FunctionTool:
-    async def check_execution(*, instance_id: str, wait_seconds: int = 0) -> str:
-        """Check the status of a code execution and retrieve its result."""
+def _extract_durable_result(instance_id: str, raw_output: Any) -> str:
+    """Extract a clean result string from the orchestration output.
+
+    Combines stdout (from print) and output (last expression value) like Jupyter.
+    """
+    stdout = ""
+    output_val = None
+
+    if isinstance(raw_output, dict):
+        stdout = raw_output.get("stdout", "")
+        output_val = raw_output.get("output")
+    elif isinstance(raw_output, str):
+        try:
+            parsed = json.loads(raw_output)
+            if isinstance(parsed, dict):
+                stdout = parsed.get("stdout", "")
+                output_val = parsed.get("output")
+            else:
+                stdout = raw_output
+        except json.JSONDecodeError:
+            stdout = raw_output
+
+    # Combine: stdout first, then output value (if not None)
+    parts = []
+    if stdout and stdout.strip():
+        parts.append(stdout.strip())
+    if output_val is not None:
+        parts.append(json.dumps(output_val) if not isinstance(output_val, str) else output_val)
+
+    result = "\n".join(parts) if parts else "(no output)"
+
+    return json.dumps({
+        "instance_id": instance_id,
+        "status": "Completed",
+        "result": result,
+    })
+
+
+def _make_get_execution_result_tool(durable_client: Any) -> FunctionTool:
+    async def get_execution_result(*, instance_id: str, wait_seconds: int = 0) -> str:
+        """Get the result of a durable code execution. You MUST call this after start_execute_code."""
+        print(f"[get_execution_result] instance_id={instance_id}, wait_seconds={wait_seconds}")
         if wait_seconds > 0:
             await asyncio.sleep(min(wait_seconds, 60))
 
         status = await durable_client.get_status(instance_id)
         if status is None:
+            print(f"[get_execution_result] status is None")
             return json.dumps({"status": "NotFound"})
 
-        runtime_status = str(status.runtime_status)
-        result: dict[str, Any] = {"status": runtime_status}
+        runtime_status = status.runtime_status.name
+        print(f"[get_execution_result] runtime_status={runtime_status}, output={status.output}")
 
-        if runtime_status in ("Completed",):
-            result["output"] = status.output
-        elif runtime_status in ("Failed",):
-            result["error"] = str(status.output) if status.output else "Unknown error"
-
-        return json.dumps(result)
+        if runtime_status == "Completed":
+            result = _extract_durable_result(instance_id, status.output)
+            print(f"[get_execution_result] returning: {result}")
+            return result
+        elif runtime_status == "Failed":
+            error_msg = str(status.output) if status.output else "Unknown error"
+            return json.dumps({"status": "Failed", "error": error_msg})
+        else:
+            return json.dumps({"status": runtime_status})
 
     return FunctionTool(
-        name="check_execution",
-        description="Check the status of a code execution and retrieve its result. Use wait_seconds to delay before checking.",
-        func=check_execution,
+        name="get_execution_result",
+        description=(
+            "Get the result of a durable code execution. You MUST call this after every start_execute_code call. "
+            "Returns JSON with a `status` field: 'Running', 'Completed', or 'Failed'. "
+            "When status is 'Completed', the `result` field contains the output. "
+            "When status is 'Running', call again with `wait_seconds=3` to wait before re-checking. "
+            "Keep calling until status is 'Completed' or 'Failed'."
+        ),
+        func=get_execution_result,
     )
 
 
@@ -255,7 +312,7 @@ def register_durable_codeact(
         tool_names.add(name)
 
     # Generate type stubs from tool signatures
-    _type_stubs = generate_type_stubs(tool_map) if tool_map else None
+    _type_stubs = generate_type_stubs(tool_map, durable=True) if tool_map else None
 
     # Register orchestrator
     @app.orchestration_trigger(context_name="context")

@@ -82,8 +82,9 @@ The DTS dashboard is at `http://localhost:8082`.
 │         ▼                   ▼                            │
 │  ┌──────────────────────────────────────┐                │
 │  │  CodeActProvider (ContextProvider)   │                │
-│  │  - injects execute_code tool         │                │
-│  │  - injects check_execution (durable) │                │
+│  │  - injects execute_code tool (non-   │                │
+│  │    durable) or start_execute_code +  │                │
+│  │    get_execution_result (durable)    │                │
 │  │  - injects CodeAct instructions      │                │
 │  └──────────────┬───────────────────────┘                │
 │                 │                                        │
@@ -95,7 +96,7 @@ The DTS dashboard is at `http://localhost:8082`.
 │  - Type-checked via ty  - Type-checked via ty            │
 │  - Direct tool calls    - Direct tool calls → activities │
 │  - asyncio.gather       - asyncio.gather → task_all      │
-│    (sequential)         - when_any → task_any            │
+│    (concurrent)         - when_any → task_any            │
 │  - Ephemeral            - Durable replay                 │
 │                         - Per-tool approval via events   │
 │                                                          │
@@ -113,8 +114,8 @@ The LLM generates Python code that calls tools directly as typed async functions
 |---|---|---|
 | `await list_users()` | Direct function call | Durable activity invocation |
 | `await get_orders_for_user(user_id=1)` | Direct function call (type-checked) | Durable activity (type-checked) |
-| `asyncio.gather(tool_a(...), tool_b(...))` | Sequential execution | Parallel via `task_all` |
-| `await when_any([{"tool": "n", "kwargs": {...}}, ...])` | Runs all, returns first | True race via `task_any` |
+| `asyncio.gather(tool_a(...), tool_b(...))` | Concurrent execution via `asyncio.gather` | Parallel via `task_all` |
+| `await when_any([{"tool": "n", "kwargs": {...}}, ...])` | Concurrent, returns first | True race via `task_any` |
 | `await wait_for_external_event('EventName')` | Rejected (not available) | Waits for external event |
 | `print(...)` | Captured in stdout | Captured in stdout |
 
@@ -146,9 +147,9 @@ The LLM generates Python code that calls tools directly as typed async functions
 
 | | Hyperlight | Monty (non-durable) | Monty (durable) |
 |---|---|---|---|
-| **Fan-out** | Sequential `call_tool` only (single-threaded WASM guest, one FFI call at a time). | `asyncio.gather(call_tool(...), ...)` — batches via FutureSnapshot, but tools execute sequentially in `_handle_future`. | `asyncio.gather(call_tool(...), ...)` — maps to `context.task_all()`, **true parallel execution** as separate activity invocations. |
-| **Race** | Not supported. | `await when_any([...])` — runs all sequentially, returns first result. | `await when_any([...])` — maps to `context.task_any()`, true race with Durable scheduling. |
-| **True parallelism** | No. Single-threaded sandbox. | No. Sequential dispatch in the Python event loop. | **Yes.** Activities are separate function invocations scheduled in parallel by the Durable runtime. |
+| **Fan-out** | Sequential `call_tool` only (single-threaded WASM guest, one FFI call at a time). | `asyncio.gather(tool_a(...), tool_b(...))` — tool calls dispatched concurrently via `asyncio.gather` + `asyncio.to_thread` for sync tools. | `asyncio.gather(tool_a(...), tool_b(...))` — maps to `context.task_all()`, **true parallel execution** as separate activity invocations. |
+| **Race** | Not supported. | `await when_any([...])` — runs all concurrently, returns first result. | `await when_any([...])` — maps to `context.task_any()`, true race with Durable scheduling. |
+| **True parallelism** | No. Single-threaded sandbox. | **Concurrent.** Multiple tool calls run concurrently on the event loop (async tools) or via `asyncio.to_thread` (sync tools). | **Yes.** Activities are separate function invocations scheduled in parallel by the Durable runtime. |
 
 ### Durability & Reliability
 
@@ -158,7 +159,7 @@ The LLM generates Python code that calls tools directly as typed async functions
 | **Survives process restart** | No. | No. | **Yes.** |
 | **External events** | Not supported. | Rejected with clear error message. | `await wait_for_external_event('name')` → `context.wait_for_external_event()`. |
 | **Human-in-the-loop** | Not supported (approval is pre-execution gating, not mid-execution). | Not supported. | **Yes** — via external events + `POST /api/orchestrations/{id}/events/{name}`. |
-| **Polling / status** | N/A (synchronous return to agent). | N/A (synchronous return). | `check_execution(instance_id, wait_seconds)` tool. LLM polls for result. |
+| **Polling / status** | N/A (synchronous return to agent). | N/A (synchronous return). | `get_execution_result(instance_id, wait_seconds)` tool. LLM polls for result. |
 
 ### Sandbox Capabilities
 
@@ -176,7 +177,7 @@ The LLM generates Python code that calls tools directly as typed async functions
 | | Hyperlight | Monty (non-durable) | Monty (durable) |
 |---|---|---|---|
 | **MAF integration** | `HyperlightCodeActProvider(ContextProvider)` | `CodeActProvider(ContextProvider)` | Same `CodeActProvider(durable=True, durable_client=client)` |
-| **Tools visible to LLM** | `execute_code` only. Provider-owned tools hidden inside sandbox description. | `execute_code` only. | `execute_code` + `check_execution`. |
+| **Tools visible to LLM** | `execute_code` only. Provider-owned tools hidden inside sandbox description. | `execute_code` only. | `start_execute_code` + `get_execution_result`. |
 | **Durable boilerplate** | N/A. | N/A. | Hidden: `register_durable_codeact(app, tools=TOOLS)` — one line to register orchestrator + activity. |
 | **Infrastructure** | None beyond compatible platform + backend packages. | None. | Azurite + DTS emulator (local) or Azure Storage + Azure DTS (cloud). |
 
@@ -192,13 +193,12 @@ The LLM generates Python code that calls tools directly as typed async functions
 
 **Monty CodeAct (non-durable):**
 - Monty interprets a Python **subset** — not all Python features or stdlib modules are available.
-- Fan-out (`asyncio.gather`) and `when_any` execute tools sequentially, not in parallel.
 - Ephemeral — no durability, no external events.
 - Per-tool mid-execution approval not available (only pre-execution gating).
 
 **Monty CodeAct (durable):**
 - Same Monty Python subset limitation.
-- `check_execution` polling relies on the LLM following instructions to poll — quality varies by model.
+- `get_execution_result` polling relies on the LLM following instructions to poll — quality varies by model.
 - Not yet exposed in DSL: durable timers, sub-orchestrations, entities, `continue_as_new`, retry policies, custom status.
 - Requires DTS infrastructure (emulator locally, Azure DTS in cloud).
 
@@ -210,7 +210,7 @@ The LLM generates Python code that calls tools directly as typed async functions
 | **Cross-platform** | Monty (both modes) |
 | **Sandbox security** | Hyperlight (WASM-level isolation with snapshot/restore) |
 | **Type safety** | Monty (both modes — ty validates tool call types before execution) |
-| **True parallel tool execution** | Monty durable (`task_all` for activities) |
+| **Concurrent tool execution** | Monty non-durable (`asyncio.gather`) and durable (`task_all`) |
 | **Durability / reliability** | Monty durable (Durable Functions replay) |
 | **Human-in-the-loop** | Monty durable (external events) |
 | **Per-tool approval** | Monty durable (mid-execution approval via external events) |
@@ -222,7 +222,7 @@ The LLM generates Python code that calls tools directly as typed async functions
 | File | Purpose |
 |---|---|
 | `function_app.py` | HTTP triggers (`/api/run`, `/api/run-durable`, `/api/orchestrations/.../events/...`), sample tools, LLM client |
-| `codeact_provider.py` | `CodeActProvider`, `execute_code`/`check_execution` tools, instructions builder, `register_durable_codeact()` |
+| `codeact_provider.py` | `CodeActProvider`, `execute_code`/`start_execute_code`/`get_execution_result` tools, instructions builder, `register_durable_codeact()` |
 | `monty_bridge.py` | `InlineCodeBridge` (non-durable) and `DurableCodeBridge` (durable) — Monty execution engines, type stub generator |
 | `requirements.txt` | Python dependencies |
 | `host.json` | Functions host config + DTS durableTask extension |
