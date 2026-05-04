@@ -204,7 +204,7 @@ The LLM generates Python code that calls tools directly as typed async functions
 
 ### Summary
 
-| Dimension | Winner |
+| Dimension | Advantage |
 |---|---|
 | **Ease of setup** | Monty non-durable (zero infra, any platform) |
 | **Cross-platform** | Monty (both modes) |
