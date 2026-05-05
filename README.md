@@ -42,6 +42,22 @@ az login
 
 Edit `local.settings.json` to set your Foundry project endpoint and model.
 
+Example:
+
+```json
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "FOUNDRY_PROJECT_ENDPOINT": "https://<your-resource>.services.ai.azure.com/api/projects/<your-project>",
+    "FOUNDRY_MODEL": "gpt-5.4",
+    "DURABLE_TASK_SCHEDULER_CONNECTION_STRING": "Endpoint=http://localhost:8080;Authentication=None",
+    "TASKHUB_NAME": "default"
+  }
+}
+```
+
 ### Run
 
 ```bash
