@@ -1,6 +1,6 @@
 # Monty CodeAct for Microsoft Agent Framework
 
-A variation of [MAF's CodeAct](https://devblogs.microsoft.com/agent-framework/codeact-with-hyperlight/) that replaces the Hyperlight WASM sandbox with [pydantic-monty](https://github.com/pydantic/monty), a Rust-based Python interpreter. Two execution modes: **non-durable** (inline, ephemeral) and **durable** (backed by Durable Functions with replay, fan-out, external events, and human-in-the-loop).
+A variation of [MAF's CodeAct](https://devblogs.microsoft.com/agent-framework/codeact-with-hyperlight/) that replaces the Hyperlight WASM sandbox with [pydantic-monty](https://github.com/pydantic/monty), a Rust-based Python interpreter. Two execution modes: **non-durable** (inline, ephemeral — runs anywhere as a plain Python library, no Azure Functions or Durable Functions required) and **durable** (backed by Durable Functions with replay, fan-out, external events, and human-in-the-loop).
 
 ## Quick Start
 
@@ -195,7 +195,7 @@ The LLM generates Python code that calls tools directly as typed async functions
 | **MAF integration** | `HyperlightCodeActProvider(ContextProvider)` | `CodeActProvider(ContextProvider)` | Same `CodeActProvider(durable=True, durable_client=client)` |
 | **Tools visible to LLM** | `execute_code` only. Provider-owned tools hidden inside sandbox description. | `execute_code` only. | `start_execute_code` + `get_execution_result`. |
 | **Durable boilerplate** | N/A. | N/A. | Hidden: `register_durable_codeact(app, tools=TOOLS)` — one line to register orchestrator + activity. |
-| **Infrastructure** | None beyond compatible platform + backend packages. | None. | Azurite + DTS emulator (local) or Azure Storage + Azure DTS (cloud). |
+| **Infrastructure** | None beyond compatible platform + backend packages. | None — runs anywhere as a plain Python library, no Azure Functions or infrastructure required. | Azure Functions runtime + Azurite + DTS emulator (local) or Azure Storage + Azure DTS (cloud). |
 
 ### Key Limitations
 
@@ -211,6 +211,7 @@ The LLM generates Python code that calls tools directly as typed async functions
 - Monty interprets a Python **subset** — not all Python features or stdlib modules are available.
 - Ephemeral — no durability, no external events.
 - Per-tool mid-execution approval not available (only pre-execution gating).
+- Runs anywhere (no Azure Functions or Durable Functions dependency), but offers no durable execution guarantees.
 
 **Monty CodeAct (durable):**
 - Same Monty Python subset limitation.
@@ -222,7 +223,7 @@ The LLM generates Python code that calls tools directly as typed async functions
 
 | Dimension | Advantage |
 |---|---|
-| **Ease of setup** | Monty non-durable (zero infra, any platform) |
+| **Ease of setup** | Monty non-durable (zero infra, any platform — no Azure Functions or Durable Functions needed) |
 | **Cross-platform** | Monty (both modes) |
 | **Sandbox security** | Hyperlight (WASM-level isolation with snapshot/restore) |
 | **Type safety** | Monty (both modes — ty validates tool call types before execution) |
